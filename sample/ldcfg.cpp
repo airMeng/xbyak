@@ -96,6 +96,15 @@ typedef struct params {
 #define GET_OFF(field) offsetof(params_t, field)
 
 
+void dump(const void *code, size_t code_size)
+{
+    FILE *file = fopen("dump.bin", "wb+");
+    if (file) {
+        size_t unused = fwrite(code, code_size, 1, file);
+        fclose(file);
+    }
+}
+
 constexpr Xbyak::Operand::Code abi_save_gpr_regs[] = {
         Xbyak::Operand::RBX,
         Xbyak::Operand::RBP,
@@ -148,9 +157,9 @@ struct ldcfg_kernel : Xbyak::CodeGenerator {
         mov(Bm, qword[rdi]);
         mov(Bn, qword[rsi]);
         mov(K, qword[rdx]);
-        mov(rcx, r8);
-        mov(r8, r9);
-        mov(r9, ARG_X(0x08));
+        mov(I, FLAG);
+        mov(FLAG, bm);
+        mov(bm, ARG_X(0x08));
         mov(LDC, ARG_X(0x10));
             
         /* Initializing tile. First value is pallate ID */
@@ -172,9 +181,9 @@ struct ldcfg_kernel : Xbyak::CodeGenerator {
         and_(K, -UNROLL_K);
 
         mov(N, Bn);
-        mov(A, rcx);
-        mov(B, r8);
-        mov(C, r9);
+        mov(A, I);
+        mov(B, FLAG);
+        mov(C, bm);
 
         /* Calculating last value for M loop */
         lea(T0, ptr[Bm - 1]);
@@ -193,10 +202,10 @@ struct ldcfg_kernel : Xbyak::CodeGenerator {
 
         L(loopM);
         /* Updating C address */
-        mov(cc1, C);
-        mov(cc2, LDC);
-        sal(cc2, SHIFT_UNROLL_N);
-        add(cc2, cc1);
+        // mov(cc1, C);
+        // mov(cc2, LDC);
+        // sal(cc2, SHIFT_UNROLL_N);
+        // add(cc2, cc1);
         add(C, UNROLL_MM * SIZE_C);
 
         mov(bm, UNROLL_MM);
@@ -347,10 +356,21 @@ private:
     const dim_t SIZE_B = 2;
     const dim_t SIZE_C = 4;
 
+public:
+    void dump(const void *code, size_t code_size)
+    {
+        FILE *file = fopen("dump.bin", "wb+");
+        if (file) {
+            size_t unused = fwrite(code, code_size, 1, file);
+            fclose(file);
+        }
+    }
+
     const Xbyak::uint8 *getCode() {
         this->ready();
         if (!is_initialized()) return nullptr;
         const Xbyak::uint8 *code = CodeGenerator::getCode();
+        dump((const void*)code, this->getSize());
         return code;
     }
 
@@ -358,6 +378,7 @@ private:
         return Xbyak::GetError() == Xbyak::ERR_NONE;
     }
 };
+
 
 class LDCFGDriver{
 public:
@@ -367,8 +388,10 @@ public:
     }
 public:
     void operator()(dim_t m, dim_t n, dim_t k, float alpha, src_t* a, src_t* b, float* c, dim_t ldc, dim_t col_offset, dim_t row_offset) const{
-    printf("before kernel\n");    
-    (*kernel_)(&m, &n, &k, &alpha, a, b, c, ldc, col_offset, row_offset);
+    printf("before kernel\n");   
+    for(int i=0;i<2;++i){ 
+        (*kernel_)(&m, &n, &k, &alpha, a, b, c, ldc, col_offset, row_offset);
+    }
     printf("after kernel\n");
     }
 
@@ -376,15 +399,6 @@ private:
     std::unique_ptr<ldcfg_kernel> kernel_;
 };
 
-
-void dump(const void *code, size_t code_size)
-{
-    FILE *file = fopen("dump.bin", "wb+");
-    if (file) {
-        size_t unused = fwrite(code, code_size, 1, file);
-        fclose(file);
-    }
-}
 
 int main () {
 
