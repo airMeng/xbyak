@@ -213,31 +213,33 @@ struct gemm_kernel : Xbyak::CodeGenerator {
     mov(esi, dword[4216 + rsp]);
     mov(cl, byte[4096 + rsp]);
     mov(r8, qword[4104 + rsp]);
-        mov       (r14d, dword [4296+rsp]                    
+    mov(r14d, dword[4296 + rsp]);
 
-        l(l31);
-        inc       (cl                                           ); 
-        add       (edi, -64                                     ); 
-        add       (rax, 64                                      ); 
-        add       (esi, 64                                      ); 
-        cmp       (cl, 16                                       ); 
-        jl        (..B1.2        # Prob 93%                     ); 
-        vzeroupper(                                             );
-        add       (rsp, 4240                                    ); 
-        pop       (rbx                                          ); 
-        pop       (r15                                          ); 
-        pop       (r14                                          ); 
-        pop       (r13                                          ); 
-        pop       (r12                                          ); 
-        ret();
+    l(l31);
+    inc(cl);
+    add(edi, -64);
+    add(rax, 64);
+    add(esi, 64);
+    cmp(cl, 16);
+    jl(..B1 .2 #Prob 93 %);
+    vzeroupper();
+    add(rsp, 4240);
+    pop(rbx);
+    pop(r15);
+    pop(r14);
+    pop(r13);
+    pop(r12);
+    ret();
 
-        l(loopMusk):
-        int num = 16;
-        int wordlen = 4;
-        const int musk[32] = [31,15,30,14,29,13,28,12,27,11,26,10,25,9,24,8,23,7,22,6,21,5,20,4,19,3,18,2,17,1,16,0];
-        for(int i = 0;i<num;++i){
+    l(loopMusk) : int num = 16;
+    int wordlen = 4;
+    const int musk[32] = [
+      31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26, 10, 25, 9, 24, 8,
+      23, 7,  22, 6,  21, 5,  20, 4,  19, 3,  18, 2,  17, 1, 16, 0
+    ];
+    for (int i = 0; i < num; ++i) {
       db(musk[i], worklen);
-        }
+    }
   }
 
  private:
