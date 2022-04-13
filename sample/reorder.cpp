@@ -4,6 +4,10 @@
 
 #include "xbyak/xbyak.h"
 
+typedef unsigned short __bfloat16_t;
+typedef __bfloat16_t src_t;
+typedef float res_t;
+
 constexpr Xbyak::Operand::Code abi_save_gpr_regs[] = {
     Xbyak::Operand::RBX, Xbyak::Operand::RBP, Xbyak::Operand::R12,
     Xbyak::Operand::R13, Xbyak::Operand::R14, Xbyak::Operand::R15,
@@ -13,17 +17,8 @@ constexpr Xbyak::Operand::Code abi_save_gpr_regs[] = {
 };
 
 struct gemm_kernel : Xbyak::CodeGenerator {
-  gemm_kernel(int m_block, int n_block, int k_block) {
+  gemm_kernel() {
     // Init parameters and check can we generate kernel or not:
-    simd_w_ = 16;
-    unroll_factor_ = m_block;
-    m_block_ = m_block;
-    n_block_ = n_block;
-    k_block_ = k_block;
-
-    if (n_block_ % simd_w_ || m_block_ > unroll_factor_) return;
-    nb_ = n_block_ / simd_w_;
-    if (nb_ > 4) return;
   }
 
   template <typename... kernel_args_t>
@@ -261,11 +256,8 @@ struct gemm_kernel : Xbyak::CodeGenerator {
 
 class GemmDriver {
  public:
-  GemmDriver(int m_, int n_, int k_) {
-    m = m_;
-    n = n_;
-    k = k_;
-    kernel_.reset(new gemm_kernel(m, n, k));
+  GemmDriver() {
+    kernel_.reset(new gemm_kernel());
     kernel_->create_kernel();
   }
 
@@ -274,54 +266,62 @@ class GemmDriver {
 
  private:
   std::unique_ptr<gemm_kernel> kernel_;
-  int m;
-  int n;
-  int k;
 };
 
+__bfloat16 make_bf16(float x)
+{
+    int* res = reinterpret_cast<int*>(&x);
+    *res = *res >> 16;
+    return (__bfloat16)*res;
+}
+
 int main() {
-  const int M = 4, N = 48, K = 4;
 
-  float *A = (float *)malloc(sizeof(float) * M * K);
-  float *B = (float *)malloc(sizeof(float) * K * N);
-  float *C = (float *)malloc(sizeof(float) * M * N);
-
-  for (int m = 0; m < M; ++m) {
-    for (int k = 0; k < K; ++k) {
-      A[m * K + k] = rand() % 10;
+  dim_t M = 1024;
+  dim_t N = 1024;
+  dim_t K = 1024;
+  dim_t bk = 1;
+  dim_t bn = 16;
+  dim_t blocks_per_group = 32;
+  dim_t shape[2] = {N, k};
+  dim_t blocksize[2] = {bk, bn};
+  dim_t* group_rowptr = (dim_t*) malloc((1 + N / bn) * sizeof(dim_t));
+  for(dim_t i = 1; i < (1 + N / bn); ++i){
+    group_rowptr[i] = (dim_t) rand() % 2 + 1 + group_rowptr[i - 1];
+  }
+  dim_t nrowptr = N/bn;
+  dim_t nnz_group = group_rowptr[N / bn];
+  dim_t* colidxs = (dim_t*) malloc( group_rowptr[N / bn] * blocks_per_group * sizeof(dim_t));
+  for(dim_t i = 0; i< (N / bn); ++i){
+    for(dim_t j = group_rowptr[i]; j < group_rowptr[i+1]; ++j){
+      dim_t nonzeros = (group_rowptr[i+1] - group_rowptr[i]) * blocks_per_group;
+      dim_t temp = K / nonzeros;
+      colidxs[j * blocks_per_group] = rand() % temp * N;
+      for(dim_t k = 1; k < nonzeros; ++k){
+        colidxs[j * blocks_per_group+k] = rand() % temp * N + colidxs[j * blocks_per_group+k-1]; 
+        assert(colidxs[j * blocks_per_group+k] < N * K);
+      }
     }
   }
-  for (int k = 0; k < K; ++k) {
-    for (int n = 0; n < N; ++n) {
-      B[k * N + n] = rand() % 10;
-    }
+
+  src_t* data = (src_t*) malloc(group_rowptr[N / bn] * blocks_per_group * bk * bn * sizeof(src_t));
+  for(dim_t i = 0; i< group_rowptr[N / bn] * blocks_per_group * bk * bn;++i){
+      data[i] = make_bf16(rand() % 10 + 1);
   }
 
-  params_t p;
-  p.A = (void *)A;
-  p.B = (void *)B;
-  p.C = (void *)C;
-
-  GemmDriver op(M, N, K);
-  op(p);
-
-  for (int m = 0; m < M; ++m) {
-    for (int n = 0; n < N; ++n) {
-      float ref = A[m * K + 0] * B[0 * N + n];
-      ref += A[m * K + 1] * B[1 * N + n];
-      ref += A[m * K + 2] * B[2 * N + n];
-      ref += A[m * K + 3] * B[3 * N + n];
-      if (C[m * N + n] != ref) {
-        printf("failed\n");
-        break;
-      };
-      // printf("%f ", C[m * N + n]);
-      // printf("%f \n", ref);
-    }
-    // printf("\n");
+  src_t* src = (src_t*) malloc(K * M * sizeof(src_t));
+  for(dim_t i = 0; i< K * M;++i){
+      src[i] = make_bf16(rand() % 10 + 1);
   }
 
-  free(A);
-  free(B);
-  free(C);
+  dst_t* dst = (dst_t*) malloc(N * M * sizeof(dst_t));
+
+  GemmDriver op();
+  op(data, src, dst, shape, blocksize, blocks_per_group, nnz_group, nrowptr, colidxs, group_rowptr, N);
+
+  free(data);
+  free(src);
+  free(dst);
+  free(group_rowptr);
+  free(colidxs);
 }
