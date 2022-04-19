@@ -1,5 +1,6 @@
 #include <err.h>
 #include <errno.h>
+#include <immintrin.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/signal.h>
@@ -25,9 +26,8 @@
 #define TILE_K 32    // Number of columns in an A tile or rows in a B tile
 #define TILE_N 16    // Number of columns in a B or C tile
 #define KPACK 2      // Vertical K packing into dword
-#define NT (N / NZ)  // (N / NZ)
-#define NZ 64        // (N / NT)
-#define NUM_N 4      // (NZ / TILE_N)
+#define MZ 64        // (M / MT)
+#define NUM_M 4      // (MZ / TILE_N)
 
 #define ARG(x, m, n) ptr[rsp + x * 32 * 16 + m * 32 + n]
 static void request_perm_xtile_data() {
@@ -44,10 +44,41 @@ static void request_perm_xtile_data() {
     printf("ARCH_REQ_XCOMP_PERM XTILE_DATA successful.\n");
 }
 
+
 typedef unsigned short __bfloat16_t;
 typedef __bfloat16_t src_t;
 typedef float dst_t;
 typedef int64_t dim_t;
+
+// Tile configure structure
+struct tileconfig_t {
+    uint8_t  palette_id;
+    uint8_t  reserved[15];
+    uint16_t colb[16];
+    uint8_t  rows[16];
+} tc = {0};
+
+void configure_tiles() {
+    // Filling tile configure structure. Could be done offline.
+    tc.palette_id = 1;
+    // Configure C tiles
+    for (int t = 0; t < 4; ++t) {
+        tc.rows[t] = TILE_M;
+        tc.colb[t] = TILE_N * sizeof(dst_t);
+    }
+    // Configure A tiles
+    for (int t = 4; t < 6; ++t) {
+        tc.rows[t] = TILE_M;
+        tc.colb[t] = TILE_K * sizeof(src_t);
+    }
+    // Configure B tile. B effectively has 64 rows and 16 columns.
+    for (int t = 6; t < 8; ++t) {
+        tc.rows[t] = TILE_K / KPACK;
+        tc.colb[t] = TILE_N * KPACK * sizeof(src_t);
+    }
+    _tile_loadconfig(&tc);
+}
+
 
 constexpr Xbyak::Operand::Code abi_save_gpr_regs[] = {
     Xbyak::Operand::RBX, Xbyak::Operand::RBP, Xbyak::Operand::R12,
@@ -103,17 +134,16 @@ struct gemm_kernel : Xbyak::CodeGenerator {
     return (jit_ker_) ? true : false;
   }
 
-  void read_params() {
+  void read_inputs() {
     mov(reg_weight, ptr[reg_param + GET_OFF(weight)]);
     mov(reg_src, ptr[reg_param + GET_OFF(src)]);
     mov(reg_dst, ptr[reg_param + GET_OFF(dst)]);
     mov(reg_bs, ptr[reg_param + GET_OFF(bs)]);
   }
 
-  void main_compute() {
-    ldtilecfg(&tc);
+  void main_compute(dim_t mstart) {
     for (int b_row = 0; b_row < nrowptr - 1; ++b_row) {
-      int n_start = nt * NZ;
+      // int n_start = nt * NZ;
       tilezero(tmm0);
       tilezero(tmm1);
       tilezero(tmm2);
@@ -125,16 +155,14 @@ struct gemm_kernel : Xbyak::CodeGenerator {
 
         tileloadd(tmm6, ptr[reg_weight + group * TILE_M * TILE_K]);
 
-        for (int n = n_start; n < n_start + NZ; n += TILE_N) {
-          // unrolling hurts performance for some reason I don't understand
-          // memory load is 40% of entire runtime, can't see how to speed up
-          // though
+        
+        for (int m = mstart; m < mstart + tileM; m += TILE_M) {
           for (int k = 0; k < 32; k += 2) {
-            vmovdqu(ymm0, ptr[reg_src + n + my_rows[k]]);
-            vmovdqu(ymm1, ptr[reg_src + n + my_rows[k + 1]]);
-            vinserti32x8(zmm0, zmm1, 1);
+            vmovdqu(ymm0, ptr[reg_src + m + my_rows[k]]);
+            vmovdqu(ymm1, ptr[reg_src + m + my_rows[k + 1]]);
+            vinserti32x8(zmm0, zmm0, zmm1, 1);
             vpermw(zmm0, reg_musk, zmm0);
-            vmovdqu(ARG(n - n_start / TILE_N, k / 2, 0), zmm0);
+            vmovdqu(ARG(m - mstart / TILE_N, k / 2, 0), zmm0);
           }
         }
         tileloadd(tmm4, ptr[rsp]);
@@ -146,9 +174,10 @@ struct gemm_kernel : Xbyak::CodeGenerator {
         tileloadd(tmm4, ptr[rsp + 0xc00]);
         tdpbf16ps(tmm3, tmm6, tmm4);
       }
-      mov(rax, reg_bs);
-      imul(rax, 16 * b_row);
-      add(rax, n_start);
+      mov(rax, b_row);
+      shl(rax, 4);
+      imul(rax, reg_bs);
+      add(rax, reg_mstart);
       mov(r12, ptr[reg_dst + rax]);
       lea(r11, ptr[r12]);
       tilestored(ptr[r11], tmm0);
@@ -170,18 +199,28 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   // }
 
   void loop_N() {
+    dim_t mstart = 0;
     L(l1);
-    main_compute();
     add(reg_mstart, tileM);
+    main_compute(mstart);
+    mstart += tileM;
     cmp(reg_mstart, reg_bs);
     jl(l1, T_NEAR);
   }
 
+  void init_param() {
+      mov(reg_K, K);
+      mov(reg_N, N);
+      mov(reg_mstart, 0);
+      mov(reg_nstart, 0);
+      vpmovzxbd(reg_musk, ptr[rip + loopMusk]);
+  }
+
   void generate() {
     Xbyak::util::StackFrame spmm_sf(this, 4, 0, 4028);
-    read_params();
-    mov(reg_mstart, 0x0);
-    vpmovzxbd(reg_musk, ptr[rip + loopMusk]);
+    read_inputs();
+    init_param();
+    loop_N();
   }
 
   void load_musk() {
@@ -205,6 +244,8 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   const Xbyak::Reg64& reg_src = rdx;
   const Xbyak::Reg64& reg_dst = rcx;
   const Xbyak::Reg64& reg_bs = r8;
+  const Xbyak::Reg64& reg_K = rbx;
+  const Xbyak::Reg64& reg_N = rbp;
   const Xbyak::Reg64& reg_mstart = r9;
   const Xbyak::Reg64& reg_nstart = r10;
   const Xbyak::Zmm& reg_musk = zmm31;
@@ -217,7 +258,7 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   dim_t* colidxs;
   dim_t* group_rowptr;
 
-  dim_t tileM = 4;
+  dim_t tileM = 64; // 4x16
 
   Xbyak::Label loopMusk;
   Xbyak::Label l1, l2, l3, l4;
@@ -257,6 +298,7 @@ __bfloat16_t make_bf16(float x) {
 
 int main() {
   request_perm_xtile_data();
+  configure_tiles();
   dim_t M = 1024;
   dim_t N = 1024;
   dim_t K = 1024;
@@ -318,7 +360,7 @@ int main() {
   inputs.dst = dst;
 
   GemmDriver op(param);
-  op(data, src, dst);
+  op(inputs);
 
   free(data);
   free(src);

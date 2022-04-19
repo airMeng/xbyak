@@ -22,6 +22,8 @@ struct Code : public Xbyak::CodeGenerator {
         mov(rax, eax);
 		add(rax, rsi);
 		add(rax, rdx);
+        mov(edi, 4);
+        add(rax, edi);
         mov(ptr[rcx], rax);
         // pop(rcx);
         // pop(rdx);
