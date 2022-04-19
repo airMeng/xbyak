@@ -18,7 +18,7 @@ struct Code : public Xbyak::CodeGenerator {
         // push(rsi);
         // push(rdx);
         // push(rcx);
-		mov(eax, ptr[rdi]);
+		mov(eax, ptr[rdi + 4]);
         mov(rax, eax);
 		add(rax, rsi);
 		add(rax, rdx);
@@ -35,13 +35,16 @@ struct Code : public Xbyak::CodeGenerator {
 int main()
 {
 	Code c;
-    int a = 3;
+    int* a = (int*) malloc(2 * sizeof(int));
+    a[0] = 3;
+    a[1] = 4;
     int res;
 	void (*f)(int*, int, int, int*) = c.getCode<void(*) (int*, int, int, int*)>();
-	f(&a, 5, 2, &res);
-	if (res == 3 + 5 + 2) {
+	f(a, 5, 2, &res);
+	if (res == 4 + 5 + 2) {
 		puts("ok");
 	} else {
+        printf("res = %d\n", res);
 		puts("ng");
 	}
 }

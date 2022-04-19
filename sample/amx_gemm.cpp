@@ -5,7 +5,9 @@
 #include <sys/signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <xbyak/xbyak_util.h>
 
+#include <cstddef>
 #include <memory>
 
 #include "xbyak/xbyak.h"
@@ -19,7 +21,15 @@
 
 #define ARCH_GET_XCOMP_PERM 0x1022
 #define ARCH_REQ_XCOMP_PERM 0x1023
+#define TILE_M 16    // Number of rows in an A or C tile
+#define TILE_K 32    // Number of columns in an A tile or rows in a B tile
+#define TILE_N 16    // Number of columns in a B or C tile
+#define KPACK 2      // Vertical K packing into dword
+#define NT (N / NZ)  // (N / NZ)
+#define NZ 64        // (N / NT)
+#define NUM_N 4      // (NZ / TILE_N)
 
+#define ARG(x, m, n) ptr[rsp + x * 32 * 16 + m * 32 + n]
 static void request_perm_xtile_data() {
   unsigned long bitmask;
   long rc;
@@ -47,9 +57,37 @@ constexpr Xbyak::Operand::Code abi_save_gpr_regs[] = {
 #endif
 };
 
+typedef struct amx_params {
+  dim_t shape[1];
+  dim_t blocksize[1];
+  dim_t blocks_per_group;
+  dim_t nnz_group;
+  dim_t nrowptr;
+  dim_t* colidxs;
+  dim_t* group_rowptr;
+} amx_params_t;
+
+template <typename T, typename Q>
+struct amx_inputs {
+  T* weight;
+  T* src;
+  Q* dst;
+  dim_t bs;
+};
+typedef amx_inputs<src_t, dst_t> amx_inputs_t;
+
+#define GET_OFF(field) offsetof(amx_inputs_t, field)
+
 struct gemm_kernel : Xbyak::CodeGenerator {
-  gemm_kernel() {
+  gemm_kernel(amx_params_t params_) {
     // Init parameters and check can we generate kernel or not:
+    params = params_;
+    N = params.shape[0];
+    K = params.shape[1];
+    nnz_group = params.nnz_group;
+    nrowptr = params.nrowptr;
+    colidxs = params.colidxs;
+    group_rowptr = params.group_rowptr;
   }
 
   template <typename... kernel_args_t>
@@ -65,200 +103,88 @@ struct gemm_kernel : Xbyak::CodeGenerator {
     return (jit_ker_) ? true : false;
   }
 
+  void read_params() {
+    mov(reg_weight, ptr[reg_param + GET_OFF(weight)]);
+    mov(reg_src, ptr[reg_param + GET_OFF(src)]);
+    mov(reg_dst, ptr[reg_param + GET_OFF(dst)]);
+    mov(reg_bs, ptr[reg_param + GET_OFF(bs)]);
+  }
+
+  void main_compute() {
+    ldtilecfg(&tc);
+    for (int b_row = 0; b_row < nrowptr - 1; ++b_row) {
+      int n_start = nt * NZ;
+      tilezero(tmm0);
+      tilezero(tmm1);
+      tilezero(tmm2);
+      tilezero(tmm3);
+
+      for (int group = group_rowptr[b_row]; group < group_rowptr[b_row + 1];
+           ++group) {
+        dim_t* my_rows = colidxs + group * 32;
+
+        tileloadd(tmm6, ptr[reg_weight + group * TILE_M * TILE_K]);
+
+        for (int n = n_start; n < n_start + NZ; n += TILE_N) {
+          // unrolling hurts performance for some reason I don't understand
+          // memory load is 40% of entire runtime, can't see how to speed up
+          // though
+          for (int k = 0; k < 32; k += 2) {
+            vmovdqu(ymm0, ptr[reg_src + n + my_rows[k]]);
+            vmovdqu(ymm1, ptr[reg_src + n + my_rows[k + 1]]);
+            vinserti32x8(zmm0, zmm1, 1);
+            vpermw(zmm0, reg_musk, zmm0);
+            vmovdqu(ARG(n - n_start / TILE_N, k / 2, 0), zmm0);
+          }
+        }
+        tileloadd(tmm4, ptr[rsp]);
+        tdpbf16ps(tmm0, tmm6, tmm6);
+        tileloadd(tmm4, ptr[rsp + 0x400]);
+        tdpbf16ps(tmm1, tmm6, tmm4);
+        tileloadd(tmm4, ptr[rsp + 0x800]);
+        tdpbf16ps(tmm2, tmm6, tmm4);
+        tileloadd(tmm4, ptr[rsp + 0xc00]);
+        tdpbf16ps(tmm3, tmm6, tmm4);
+      }
+      mov(rax, reg_bs);
+      imul(rax, 16 * b_row);
+      add(rax, n_start);
+      mov(r12, ptr[reg_dst + rax]);
+      lea(r11, ptr[r12]);
+      tilestored(ptr[r11], tmm0);
+      lea(r11, ptr[r11 + TILE_N]);
+      tilestored(ptr[r11], tmm1);
+      lea(r11, ptr[r11 + TILE_N]);
+      tilestored(ptr[r11], tmm2);
+      lea(r11, ptr[r11 + TILE_N]);
+      tilestored(ptr[r11], tmm3);
+    }
+  }
+
+  // void loop_K() {
+  //   L(l2);
+  //   main_compute();
+  //   add(reg_nstart, 1);
+  //   cmp(reg_nstart, nrowptr);
+  //   jb(l2);
+  // }
+
+  void loop_N() {
+    L(l1);
+    main_compute();
+    add(reg_mstart, tileM);
+    cmp(reg_mstart, reg_bs);
+    jl(l1, T_NEAR);
+  }
+
   void generate() {
-    push(r12);
-    push(r13);
-    push(r14);
-    push(r15);
-    push(rbx);
-    sub(rsp, 0x1090);
-    Xbyak::Label loopMusk;
-    Xbyak::Label l1, l2, l4, l10, l12, l13, l25, l31;
-    mov(r9, rsi);
-    mov(eax, dword[0x10e0 + rsp]);
-    mov(r11, rdi);
-    mov(r10d, eax);
-    xor_(esi, esi);
-    mov(ebx, dword[0x10c8 + rsp]);
-    mov(r8, rdx);
-    shl(r10d, 0x4);
-    xor_(cl, cl);
-    movsxd(r10, r10d);
-    lea(edx, dword[rax * 0x4]);
-    mov(r14d, dword[0x10c8 + rsp]);
-    lea(ebx, dword[rbx - 0x1]);
-    vmovups(zmm0, ptr[rip + loopMusk]);
-    xor_(edi, edi);
-    mov(qword[0x1010 + rsp], r10);
-    xor_(eax, eax);
-    mov(qword[0x1048 + rsp], r11);
-    mov(qword[0x1050 + rsp], r9);
-    L(l2);
-    xor_(r12d, r12d);
-    xor_(r11d, r11d);
-    xor_(r9d, r9d);
-    mov(r13d, 1);
-    cmp(r14d, 1);
-    jle(l31);
-    movsxd(rsi, esi);
-    mov(byte[0x1000 + rsp], cl);
-    lea(r15d, dword[0x40 + rsi]);
-    mov(qword[0x101e + rsp], r8);
-    mov(dword[0x1096 + rsp], r15d);
-    mov(qword[0x1068 + rsp], rax);
-    lea(r10, qword[r8 + rsi * 4]);
-    mov(dword[0x1070 + rsp], edi);
-    mov(dword[0x1078 + rsp], esi);
-    mov(r8, qword[0x1010 + rsp]);
-    mov(rcx, qword[0x10d8 + rsp]);
-    mov(r14, qword[0x10d0 + rsp]);
-    L(l4);
-    tilezero(tmm0);
-    tilezero(tmm1);
-    tilezero(tmm2);
-    tilezero(tmm3);
-    mov(esi, dword[rcx + r12 * 4]);
-    mov(edi, esi);
-    shl(edi, 5);
-    mov(eax, esi);
-    movsxd(rdi, edi);
-    shl(eax, 9);
-    movsxd(rax, eax);
-    add(rax, rax);
-    lea(rdi, qword[r14 + rdi * 4]);
-    cmp(esi, dword[rcx + r13 * 4]);
-    jge(l25);
-    mov(qword[0x1018 + rsp], r10);
-    mov(qword[0x1020 + rsp], r9);
-    lea(r15, qword[0xc00 + rsp]);
-    mov(qword[0x428 + r15], r12);
-    lea(r12, qword[0x800 + rsp]);
-    mov(dword[0x430 + r15], r11d);
-    lea(r11, qword[0x400 + rsp]);
-    mov(dword[0xc38 + r11], ebx);
-    mov(dword[0xc40 + r11], edx);
-    mov(r14d, dword[0xc70 + r11]);
-    mov(r10d, dword[0xc78 + r11]);
-    mov(r9, qword[0xc48 + r11]);
+    Xbyak::util::StackFrame spmm_sf(this, 4, 0, 4028);
+    read_params();
+    mov(reg_mstart, 0x0);
+    vpmovzxbd(reg_musk, ptr[rip + loopMusk]);
+  }
 
-    L(l10);
-    mov(ebx, 64);
-    tileloadd(tmm6, qword[r9 + rax]);
-
-    mov(dword[4184 + rsp], esi);
-    mov(r8d, r10d);
-    mov(rdx, qword[4200 + rsp]);
-    lea(ebx, dword[r10 + r14]);
-    mov(r9d, dword[4224 + rsp]);
-    mov(rsi, qword[4176 + rsp]);
-    mov(qword[4192 + rsp], r13);
-    L(l12);
-    mov(ecx, ebx);
-    xor_(r13d, r13d);
-    sar(ecx, 3);
-    shr(ecx, 28);
-    add(ecx, ebx);
-    sar(ecx, 4);
-    movsxd(rcx, ecx);
-    shl(rcx, 10);
-    lea(r10, qword[rsp + rcx]);
-    lea(rcx, qword[rsi + rdx * 2]);
-    L(l13);
-    movsxd(r14, dword[rdi + r13 * 4]);
-    vmovdqu(ymm1, yword[rcx + r14 * 2]);
-    movsxd(r14, dword[4 + rdi + r13 * 4]);
-    vinserti32x8(zmm2, zmm1, yword[rcx + r14 * 2], 1);
-    mov(r14d, r13d);
-    shr(r14d, 1);
-    add(r13, 2);
-    vpermw(zmm3, zmm0, zmm2);
-    shl(r14, 6);
-    vmovdqu32(zword[r14 + r10], zmm3);
-    cmp(r13, 32);
-    jl(l13);
-    add(r8d, 16);
-    add(ebx, 16);
-    add(rdx, 16);
-    cmp(r8d, r9d);
-    jl(l12);
-    mov(r13, qword[4192 + rsp]);
-    mov(r8d, 64);
-    mov(rcx, qword[4312 + rsp]);
-    lea(rbx, qword[rsp]);
-    mov(esi, dword[4184 + rbx]);
-    mov(r14d, dword[4208 + rbx]);
-    mov(r10d, dword[4216 + rbx]);
-    mov(r9, qword[4168 + rbx]);
-    mov(edx, dword[rcx + r13 * 4]);
-
-    tileloadd(tmm4, ptr[rbx + r8 * 1]);
-    tdpbf16ps(tmm0, tmm6, tmm4);
-
-    mov(ebx, 64);
-    tileloadd(tmm4, ptr[r11 + rbx * 1]);
-    tdpbf16ps(tmm1, tmm6, tmm4);
-
-    tileloadd(tmm4, ptr[r12 + rbx * 1]);
-    tdpbf16ps(tmm2, tmm6, tmm4);
-
-    tileloadd(tmm4, ptr[r15 + rbx * 1]);
-    tdpbf16ps(tmm3, tmm6, tmm4);
-
-    inc(esi);
-    add(rdi, 128);
-    add(rax, 1024);
-    cmp(esi, edx);
-    jl(l10);
-    mov(r10, qword[4120 + rsp]);
-    mov(r9, qword[4128 + rsp]);
-    mov(r12, qword[4136 + rsp]);
-    mov(r11d, dword[4144 + rsp]);
-    mov(ebx, dword[4152 + rsp]);
-    mov(edx, dword[4160 + rsp]);
-    mov(r8, qword[4112 + rsp]);
-    mov(r14, qword[4304 + rsp]);
-    L(l25);
-    lea(rsi, qword[r10 + r9 * 4]);
-    tilestored(ptr[rax + rdx * 1], tmm0);
-
-    lea(rax, qword[64 + rsi]);
-    tilestored(ptr[rax + rdx * 1], tmm1);
-
-    lea(rax, qword[128 + rsi]);
-    tilestored(ptr[rax + rdx * 1], tmm2);
-
-    add(rsi, 192);
-    tilestored(ptr[rsi + rdx * 1], tmm3);
-
-    inc(r11d);
-    add(r9, r8);
-    inc(r13);
-    inc(r12);
-    cmp(r11d, ebx);
-    jl(l4);
-    mov(rax, qword[4200 + rsp]);
-    mov(edi, dword[4208 + rsp]);
-    mov(esi, dword[4216 + rsp]);
-    mov(cl, byte[4096 + rsp]);
-    mov(r8, qword[4104 + rsp]);
-    mov(r14d, dword[4296 + rsp]);
-
-    L(l31);
-    inc(cl);
-    add(edi, -64);
-    add(rax, 64);
-    add(esi, 64);
-    cmp(cl, 16);
-    jl(l2);
-    vzeroupper();
-    add(rsp, 4240);
-    pop(rbx);
-    pop(r15);
-    pop(r14);
-    pop(r13);
-    pop(r12);
-    ret();
-
+  void load_musk() {
     L(loopMusk);
     int num = 16;
     int wordlen = 4;
@@ -271,10 +197,30 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   }
 
  private:
+  amx_params_t params;
   const Xbyak::uint8* jit_ker_ = nullptr;
 
-  const Xbyak::Zmm& reg_musk = zmm0;
+  const Xbyak::Reg64& reg_param = rdi;
+  const Xbyak::Reg64& reg_weight = rsi;
+  const Xbyak::Reg64& reg_src = rdx;
+  const Xbyak::Reg64& reg_dst = rcx;
+  const Xbyak::Reg64& reg_bs = r8;
+  const Xbyak::Reg64& reg_mstart = r9;
+  const Xbyak::Reg64& reg_nstart = r10;
+  const Xbyak::Zmm& reg_musk = zmm31;
 
+  dim_t N;
+  dim_t K;
+  const dim_t blocks_per_group = 32;
+  dim_t nnz_group;
+  dim_t nrowptr;
+  dim_t* colidxs;
+  dim_t* group_rowptr;
+
+  dim_t tileM = 4;
+
+  Xbyak::Label loopMusk;
+  Xbyak::Label l1, l2, l3, l4;
   const Xbyak::uint8* getCode() {
     this->ready();
     if (!is_initialized()) return nullptr;
@@ -289,18 +235,14 @@ struct gemm_kernel : Xbyak::CodeGenerator {
 
 class GemmDriver {
  public:
-  GemmDriver() {
-    kernel_.reset(new gemm_kernel());
+  GemmDriver(amx_params_t params) {
+    kernel_.reset(new gemm_kernel(params));
     kernel_->create_kernel();
   }
 
  public:
-  void operator()(src_t* weight, src_t* activation, dst_t* result,
-                  dim_t shape[2], dim_t block_size[2], int blocks_per_group,
-                  dim_t nnz_group, dim_t nrowptr, dim_t* colidxs,
-                  dim_t* group_rowptr, dim_t n_size) const {
-    (*kernel_)(weight, activation, result, shape, block_size, blocks_per_group,
-               nnz_group, nrowptr, colidxs, group_rowptr, n_size);
+  void operator()(src_t* weight, src_t* activation, dst_t* result) const {
+    (*kernel_)(weight, activation, result);
   }
 
  private:
@@ -359,9 +301,24 @@ int main() {
 
   dst_t* dst = (dst_t*)malloc(N * M * sizeof(dst_t));
 
-  GemmDriver op;
-  op(data, src, dst, shape, blocksize, blocks_per_group, nnz_group, nrowptr,
-     colidxs, group_rowptr, N);
+  amx_params_t param;
+  param.shape[0] = shape[0];
+  param.shape[1] = shape[1];
+  param.blocksize[0] = blocksize[0];
+  param.blocksize[1] = blocksize[1];
+  param.blocks_per_group = blocks_per_group;
+  param.nnz_group = nnz_group;
+  param.nrowptr = nrowptr;
+  param.colidxs = colidxs;
+  param.group_rowptr = group_rowptr;
+
+  amx_inputs_t inputs;
+  inputs.weight = data;
+  inputs.src = src;
+  inputs.dst = dst;
+
+  GemmDriver op(param);
+  op(data, src, dst);
 
   free(data);
   free(src);
