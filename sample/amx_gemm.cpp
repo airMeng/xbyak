@@ -22,12 +22,12 @@
 
 #define ARCH_GET_XCOMP_PERM 0x1022
 #define ARCH_REQ_XCOMP_PERM 0x1023
-#define TILE_M 16    // Number of rows in an A or C tile
-#define TILE_K 32    // Number of columns in an A tile or rows in a B tile
-#define TILE_N 16    // Number of columns in a B or C tile
-#define KPACK 2      // Vertical K packing into dword
-#define MZ 64        // (M / MT)
-#define NUM_M 4      // (MZ / TILE_N)
+#define TILE_M 16  // Number of rows in an A or C tile
+#define TILE_K 32  // Number of columns in an A tile or rows in a B tile
+#define TILE_N 16  // Number of columns in a B or C tile
+#define KPACK 2    // Vertical K packing into dword
+#define MZ 64      // (M / MT)
+#define NUM_M 4    // (MZ / TILE_N)
 
 #define ARG(x, m, n) ptr[rsp + x * 32 * 16 + m * 32 + n]
 static void request_perm_xtile_data() {
@@ -44,7 +44,6 @@ static void request_perm_xtile_data() {
     printf("ARCH_REQ_XCOMP_PERM XTILE_DATA successful.\n");
 }
 
-
 typedef unsigned short __bfloat16_t;
 typedef __bfloat16_t src_t;
 typedef float dst_t;
@@ -52,33 +51,32 @@ typedef int64_t dim_t;
 
 // Tile configure structure
 struct tileconfig_t {
-    uint8_t  palette_id;
-    uint8_t  reserved[15];
-    uint16_t colb[16];
-    uint8_t  rows[16];
+  uint8_t palette_id;
+  uint8_t reserved[15];
+  uint16_t colb[16];
+  uint8_t rows[16];
 } tc = {0};
 
 void configure_tiles() {
-    // Filling tile configure structure. Could be done offline.
-    tc.palette_id = 1;
-    // Configure C tiles
-    for (int t = 0; t < 4; ++t) {
-        tc.rows[t] = TILE_M;
-        tc.colb[t] = TILE_N * sizeof(dst_t);
-    }
-    // Configure A tiles
-    for (int t = 4; t < 6; ++t) {
-        tc.rows[t] = TILE_M;
-        tc.colb[t] = TILE_K * sizeof(src_t);
-    }
-    // Configure B tile. B effectively has 64 rows and 16 columns.
-    for (int t = 6; t < 8; ++t) {
-        tc.rows[t] = TILE_K / KPACK;
-        tc.colb[t] = TILE_N * KPACK * sizeof(src_t);
-    }
-    _tile_loadconfig(&tc);
+  // Filling tile configure structure. Could be done offline.
+  tc.palette_id = 1;
+  // Configure C tiles
+  for (int t = 0; t < 4; ++t) {
+    tc.rows[t] = TILE_M;
+    tc.colb[t] = TILE_N * sizeof(dst_t);
+  }
+  // Configure A tiles
+  for (int t = 4; t < 6; ++t) {
+    tc.rows[t] = TILE_M;
+    tc.colb[t] = TILE_K * sizeof(src_t);
+  }
+  // Configure B tile. B effectively has 64 rows and 16 columns.
+  for (int t = 6; t < 8; ++t) {
+    tc.rows[t] = TILE_K / KPACK;
+    tc.colb[t] = TILE_N * KPACK * sizeof(src_t);
+  }
+  _tile_loadconfig(&tc);
 }
-
 
 constexpr Xbyak::Operand::Code abi_save_gpr_regs[] = {
     Xbyak::Operand::RBX, Xbyak::Operand::RBP, Xbyak::Operand::R12,
@@ -142,6 +140,7 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   }
 
   void main_compute(dim_t mstart) {
+    push(reg_weight);
     for (int b_row = 0; b_row < nrowptr - 1; ++b_row) {
       // int n_start = nt * NZ;
       tilezero(tmm0);
@@ -153,9 +152,10 @@ struct gemm_kernel : Xbyak::CodeGenerator {
            ++group) {
         dim_t* my_rows = colidxs + group * 32;
 
-        tileloadd(tmm6, ptr[reg_weight + group * TILE_M * TILE_K]);
+        mov(r13, group);
+        sal(r13, 0x9);
+        tileloadd(tmm6, ptr[reg_weight + r13]);
 
-        
         for (int m = mstart; m < mstart + tileM; m += TILE_M) {
           for (int k = 0; k < 32; k += 2) {
             vmovdqu(ymm0, ptr[reg_src + m + my_rows[k]]);
@@ -188,6 +188,7 @@ struct gemm_kernel : Xbyak::CodeGenerator {
       lea(r11, ptr[r11 + TILE_N]);
       tilestored(ptr[r11], tmm3);
     }
+    pop(reg_weight);
   }
 
   // void loop_K() {
@@ -209,17 +210,18 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   }
 
   void init_param() {
-      mov(reg_K, K);
-      mov(reg_N, N);
-      mov(reg_mstart, 0);
-      mov(reg_nstart, 0);
-      vpmovzxbd(reg_musk, ptr[rip + loopMusk]);
+    mov(reg_K, K);
+    mov(reg_N, N);
+    mov(reg_mstart, 0);
+    mov(reg_nstart, 0);
+    vpmovzxbd(reg_musk, ptr[rip + loopMusk]);
   }
 
   void generate() {
     Xbyak::util::StackFrame spmm_sf(this, 4, 0, 4028);
     read_inputs();
     init_param();
+    vmovdqu(ymm0, ptr[reg_weight]);
     loop_N();
   }
 
@@ -240,7 +242,7 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   const Xbyak::uint8* jit_ker_ = nullptr;
 
   const Xbyak::Reg64& reg_param = rdi;
-  const Xbyak::Reg64& reg_weight = rsi;
+  const Xbyak::Reg64& reg_weight = r15;
   const Xbyak::Reg64& reg_src = rdx;
   const Xbyak::Reg64& reg_dst = rcx;
   const Xbyak::Reg64& reg_bs = r8;
@@ -258,7 +260,7 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   dim_t* colidxs;
   dim_t* group_rowptr;
 
-  dim_t tileM = 64; // 4x16
+  dim_t tileM = 64;  // 4x16
 
   Xbyak::Label loopMusk;
   Xbyak::Label l1, l2, l3, l4;
@@ -282,9 +284,7 @@ class GemmDriver {
   }
 
  public:
-  void operator()(src_t* weight, src_t* activation, dst_t* result) const {
-    (*kernel_)(weight, activation, result);
-  }
+  void operator()(amx_inputs_t inputs) const { (*kernel_)(inputs); }
 
  private:
   std::unique_ptr<gemm_kernel> kernel_;
@@ -321,7 +321,7 @@ int main() {
           (group_rowptr[i + 1] - group_rowptr[i]) * blocks_per_group;
       dim_t temp = K / nonzeros;
       colidxs[j * blocks_per_group] = rand() % temp * N;
-      for (dim_t k = 1; k < nonzeros; ++k) {
+      for (dim_t k = 1; k < blocks_per_group; ++k) {
         colidxs[j * blocks_per_group + k] =
             rand() % temp * N + colidxs[j * blocks_per_group + k - 1];
         assert(colidxs[j * blocks_per_group + k] < N * K);
