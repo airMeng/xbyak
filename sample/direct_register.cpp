@@ -55,8 +55,8 @@ struct Code : public Xbyak::CodeGenerator {
     vmovups(zmm1, zword[rsi]);
     vaddps(zmm0, zmm1);
 
-    vmovups(zword[rsp + 4096], zmm0);
-    // vmovups(EVEX_compress_addr(rsp, 0x10), zmm0);
+    // vmovdqu(zword[rsp + 4096], zmm0);
+    vmovdqu32(EVEX_compress_addr(rsp, 4096), zmm0);
     mov(rdi, ptr[rsp + 4104]);
     add(rax, rdi);
     add(rax, rdx);

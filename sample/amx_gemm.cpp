@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <xbyak/xbyak_util.h>
 
+#include <climits>
 #include <cstddef>
 #include <memory>
 
@@ -29,7 +30,7 @@
 #define MZ 64      // (M / MT)
 #define NUM_M 4    // (MZ / TILE_N)
 
-#define ARG(x, m, n) ptr[rsp + x * 32 * 16 + m * 32 + n]
+#define ARG(x, m, n) zword[rsp + x * 32 * 16 + m * 32 + n]
 static void request_perm_xtile_data() {
   unsigned long bitmask;
   long rc;
@@ -107,8 +108,44 @@ typedef amx_inputs<src_t, dst_t> amx_inputs_t;
 
 #define GET_OFF(field) offsetof(amx_inputs_t, field)
 
+Xbyak::Address EVEX_compress_addr(Xbyak::Reg64 base, int raw_offt,
+                                  bool bcast = false) {
+  using Xbyak::Address;
+  using Xbyak::Reg64;
+  using Xbyak::RegExp;
+  using Xbyak::Zmm;
+  const int EVEX_max_8b_offt = 0x200;
+  const Xbyak::Reg64 reg_EVEX_max_8b_offt = Xbyak::util::rbp;
+
+  assert(raw_offt <= INT_MAX);
+  auto offt = static_cast<int>(raw_offt);
+
+  int scale = 0;
+
+  if (EVEX_max_8b_offt <= offt && offt < 3 * EVEX_max_8b_offt) {
+    offt = offt - 2 * EVEX_max_8b_offt;
+    scale = 1;
+  } else if (3 * EVEX_max_8b_offt <= offt && offt < 5 * EVEX_max_8b_offt) {
+    offt = offt - 4 * EVEX_max_8b_offt;
+    scale = 2;
+  }
+
+  auto re = RegExp() + base + offt;
+  if (scale) re = re + reg_EVEX_max_8b_offt * scale;
+
+  if (bcast)
+    return Xbyak::util::zword_b[re];
+  else
+    return Xbyak::util::zword[re];
+}
+
+typedef enum {
+    MAX_CODE_SIZE = 256 * 1024,
+} max_code_size_t;
+
 struct gemm_kernel : Xbyak::CodeGenerator {
-  gemm_kernel(amx_params_t params_) {
+  gemm_kernel(amx_params_t params_)         
+    : Xbyak::CodeGenerator(MAX_CODE_SIZE, Xbyak::AutoGrow){
     // Init parameters and check can we generate kernel or not:
     params = params_;
     N = params.shape[0];
@@ -157,22 +194,30 @@ struct gemm_kernel : Xbyak::CodeGenerator {
         tileloadd(tmm6, ptr[reg_weight + r13]);
 
         for (int m = mstart; m < mstart + tileM; m += TILE_M) {
-          for (int k = 0; k < 32; k += 2) {
+          for (int k = 2; k < 32; k += 2) {
             vmovdqu(ymm0, ptr[reg_src + m + my_rows[k]]);
             vmovdqu(ymm1, ptr[reg_src + m + my_rows[k + 1]]);
-            vinserti32x8(zmm0, zmm0, zmm1, 1);
+            vinserti32x8(zmm0, zmm0, ymm1, 1);
             vpermw(zmm0, reg_musk, zmm0);
-            vmovdqu(ARG(m - mstart / TILE_N, k / 2, 0), zmm0);
+            // lea(rax, ptr[rsp + (m - mstart / TILE_N)*512 + k / 2 * 32]);
+            // mov(rax, EVEX_compress_addr(
+            //              rsp, (m - mstart / TILE_N) * 512 + k / 2 * 32));
+            vmovdqu32(EVEX_compress_addr(rsp, (m - mstart / TILE_N) * 512 + k / 2 * 32), zmm0);
           }
         }
-        tileloadd(tmm4, ptr[rsp]);
+        mov(rax, 0x0);
+        tileloadd(tmm4, ptr[rsp + rax]);
         tdpbf16ps(tmm0, tmm6, tmm6);
-        tileloadd(tmm4, ptr[rsp + 0x400]);
+        add(rax, 1024);
+        tileloadd(tmm4, ptr[rsp + rax]);
         tdpbf16ps(tmm1, tmm6, tmm4);
-        tileloadd(tmm4, ptr[rsp + 0x800]);
+        add(rax, 1024);
+        tileloadd(tmm4, ptr[rsp + rax]);
         tdpbf16ps(tmm2, tmm6, tmm4);
-        tileloadd(tmm4, ptr[rsp + 0xc00]);
+        add(rax, 1024);
+        tileloadd(tmm4, ptr[rsp + rax]);
         tdpbf16ps(tmm3, tmm6, tmm4);
+        mov(rax, 0x0);
       }
       mov(rax, b_row);
       shl(rax, 4);
@@ -218,14 +263,12 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   }
 
   void generate() {
-    Xbyak::util::StackFrame spmm_sf(this, 4, 0, 4028);
+    Xbyak::util::StackFrame spmm_sf(this, 4, 0, 5120);
     read_inputs();
     init_param();
     vmovdqu(ymm0, ptr[reg_weight]);
     loop_N();
-  }
-
-  void load_musk() {
+ 
     L(loopMusk);
     int num = 16;
     int wordlen = 4;
@@ -235,7 +278,8 @@ struct gemm_kernel : Xbyak::CodeGenerator {
     for (int i = 0; i < num; ++i) {
       db(musk[i], wordlen);
     }
-  }
+ }
+
 
  private:
   amx_params_t params;
@@ -263,7 +307,7 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   dim_t tileM = 64;  // 4x16
 
   Xbyak::Label loopMusk;
-  Xbyak::Label l1, l2, l3, l4;
+  Xbyak::Label l1;// l2, l3, l4;
   const Xbyak::uint8* getCode() {
     this->ready();
     if (!is_initialized()) return nullptr;
