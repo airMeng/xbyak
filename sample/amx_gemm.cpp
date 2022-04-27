@@ -14,6 +14,8 @@
 
 #include "xbyak/xbyak.h"
 
+#define STACKSIZE 5120
+
 #define fatal_error(msg, ...) err(1, "[FAIL]\t" msg, ##__VA_ARGS__)
 #define XFEATURE_XTILECFG 17
 #define XFEATURE_XTILEDATA 18
@@ -30,7 +32,7 @@
 #define MZ 64      // (M / MT)
 #define NUM_M 4    // (MZ / TILE_N)
 
-#define ARG(x, m, n) zword[rsp + x * 32 * 16 + m * 32 + n]
+#define TEMP(X) ptr[rsp + (0x40 + X)]
 static void request_perm_xtile_data() {
   unsigned long bitmask;
   long rc;
@@ -140,12 +142,12 @@ Xbyak::Address EVEX_compress_addr(Xbyak::Reg64 base, int raw_offt,
 }
 
 typedef enum {
-    MAX_CODE_SIZE = 256 * 1024,
+  MAX_CODE_SIZE = 256 * 1024,
 } max_code_size_t;
 
 struct gemm_kernel : Xbyak::CodeGenerator {
-  gemm_kernel(amx_params_t params_)         
-    : Xbyak::CodeGenerator(MAX_CODE_SIZE, Xbyak::AutoGrow){
+  gemm_kernel(amx_params_t params_)
+      : Xbyak::CodeGenerator(MAX_CODE_SIZE, Xbyak::AutoGrow) {
     // Init parameters and check can we generate kernel or not:
     params = params_;
     N = params.shape[0];
@@ -189,9 +191,10 @@ struct gemm_kernel : Xbyak::CodeGenerator {
            ++group) {
         dim_t* my_rows = colidxs + group * 32;
 
-        mov(r13, group);
-        sal(r13, 0x9);
-        tileloadd(tmm6, ptr[reg_weight + r13]);
+        mov(r12, sizeof(src_t));
+        mov(r13, TILE_K);
+        imul(r13, r12);
+        tileloadd(tmm6, ptr[reg_weight + r13 + group * 512]);
 
         for (int m = mstart; m < mstart + tileM; m += TILE_M) {
           for (int k = 0; k < 32; k += 2) {
@@ -199,35 +202,31 @@ struct gemm_kernel : Xbyak::CodeGenerator {
             vmovdqu(ymm1, ptr[reg_src + m + my_rows[k + 1]]);
             vinserti32x8(zmm0, zmm0, ymm1, 1);
             vpermw(zmm0, reg_mask, zmm0);
-            // lea(rax, ptr[rsp + (m - mstart / TILE_N)*512 + k / 2 * 32]);
-            // mov(rax, EVEX_compress_addr(
-            //              rsp, (m - mstart / TILE_N) * 512 + k / 2 * 32));
-            // vmovdqu32(EVEX_compress_addr(rsp, (m - mstart) / TILE_M * 512 + k / 2 * 32), zmm0);
-            vmovdqu32(qword[rsp + ((m - mstart) / TILE_M * 512 + k / 2 * 32) * 2], zmm0);
+            vmovdqu32(qword[rsp + 0x40 +
+                            ((m - mstart) / TILE_M * 512 + k / 2 * 32) * 2],
+                      zmm0);
           }
         }
-        mov(rax, 0x0);
-        tileloadd(tmm4, ptr[rsp + rax]);
+        mov(rax, 64);
+        tileloadd(tmm4, ptr[rsp + rax + 0x40]);
         tdpbf16ps(tmm0, tmm6, tmm4);
         // add(rax, 0x400);
-        tileloadd(tmm4, ptr[rsp + rax + 1024]);
+        tileloadd(tmm4, ptr[rsp + rax + 1024 + 0x40]);
         tdpbf16ps(tmm1, tmm6, tmm4);
         // add(rax, 1024);
-        tileloadd(tmm4, ptr[rsp + rax + 2048]);
+        tileloadd(tmm4, ptr[rsp + rax + 2048 + 0x40]);
         tdpbf16ps(tmm2, tmm6, tmm4);
         // add(rax, 1024);
-        tileloadd(tmm4, ptr[rsp + rax + 3072]);
+        tileloadd(tmm4, ptr[rsp + rax + 3072 + 0x40]);
         tdpbf16ps(tmm3, tmm6, tmm4);
-        mov(rax, 0x0);
       }
-      mov(rax, b_row);
-      shl(rax, 4);
-      imul(rax, reg_bs);
-      add(rax, reg_mstart);
-      tilestored(ptr[reg_dst + rax], tmm0);
-      tilestored(ptr[reg_dst + rax + TILE_N], tmm1);
-      tilestored(ptr[reg_dst + rax + TILE_N * 2], tmm2);
-      tilestored(ptr[reg_dst + rax + TILE_N * 3], tmm3);
+      mov(r12, sizeof(dst_t));
+      mov(rax, reg_bs);
+      imul(rax, r12);
+      tilestored(ptr[reg_dst + rax + b_row * 16 * M], tmm0);
+      tilestored(ptr[reg_dst + rax + b_row * 16 * M + TILE_N], tmm1);
+      tilestored(ptr[reg_dst + rax + b_row * 16 * M + TILE_N * 2], tmm2);
+      tilestored(ptr[reg_dst + rax + b_row * 16 * M + TILE_N * 3], tmm3);
     }
     pop(reg_weight);
   }
@@ -260,22 +259,43 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   }
 
   void generate() {
-    Xbyak::util::StackFrame spmm_sf(this, 4, 0, 5120);
-    read_inputs();
-    init_param();
-    loop_N();
- 
+    // Xbyak::util::StackFrame spmm_sf(this, 4, 0, 5120);
+    {
+      sub(rsp, STACKSIZE);
+
+      mov(ptr[rsp + 0x00], rbx);
+      mov(ptr[rsp + 0x08], rbp);
+      mov(ptr[rsp + 0x10], r12);
+      mov(ptr[rsp + 0x18], r13);
+      mov(ptr[rsp + 0x20], r14);
+      mov(ptr[rsp + 0x28], r15);
+
+      read_inputs();
+      init_param();
+      loop_N();
+
+      mov(rbx, ptr[rsp + 0x00]);
+      mov(rbp, ptr[rsp + 0x08]);
+      mov(r12, ptr[rsp + 0x10]);
+      mov(r13, ptr[rsp + 0x18]);
+      mov(r14, ptr[rsp + 0x20]);
+      mov(r15, ptr[rsp + 0x28]);
+
+      add(rsp, STACKSIZE);
+
+      ret();
+    }
+    align(64);
     L(loopMask);
     int num = 32;
     int wordlen = 2;
     const src_t mask[32] = {31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26,
-                          10, 25, 9,  24, 8,  23, 7,  22, 6,  21, 5,
-                          20, 4,  19, 3,  18, 2,  17, 1,  16, 0};
+                            10, 25, 9,  24, 8,  23, 7,  22, 6,  21, 5,
+                            20, 4,  19, 3,  18, 2,  17, 1,  16, 0};
     for (int i = 0; i < num; ++i) {
       db(mask[i], wordlen);
     }
- }
-
+  }
 
  private:
   amx_params_t params;
@@ -307,7 +327,7 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   Xbyak::Label loopMask;
   // Xbyak::Label l1;// l2, l3, l4;
 
-  public:
+ public:
   const Xbyak::uint8* getCode() {
     this->ready();
     if (!is_initialized()) return nullptr;
@@ -320,14 +340,12 @@ struct gemm_kernel : Xbyak::CodeGenerator {
   }
 };
 
-
-void dump(const void *code, size_t code_size)
-{
-    FILE *file = fopen("dump.bin", "wb+");
-    if (file) {
-        size_t unused = fwrite(code, code_size, 1, file);
-        fclose(file);
-    }
+void dump(const void* code, size_t code_size) {
+  FILE* file = fopen("dump.bin", "wb+");
+  if (file) {
+    size_t unused = fwrite(code, code_size, 1, file);
+    fclose(file);
+  }
 }
 
 class GemmDriver {
